@@ -1,0 +1,1398 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Black Wing Ventures · Field Tool</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Cpath d='M50 35 Q35 30 18 38 Q25 42 22 50 Q35 46 42 52 Q35 56 38 62 Q44 56 50 60 Q56 56 62 62 Q65 56 58 52 Q65 46 78 50 Q75 42 82 38 Q65 30 50 35 Z' fill='%2322d3ee'/%3E%3C/svg%3E" />
+<script src="https://cdn.tailwindcss.com"></script>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  body { margin: 0; background: #000; }
+  #loader {
+    position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    background: #000; color: #22d3ee; font-family: system-ui, sans-serif; z-index: 9999;
+    flex-direction: column; gap: 12px;
+  }
+  #loader .spin {
+    width: 32px; height: 32px; border: 2px solid #1e293b; border-top-color: #22d3ee;
+    border-radius: 50%; animation: s 0.8s linear infinite;
+  }
+  @keyframes s { to { transform: rotate(360deg); } }
+  .loader-text { font-size: 10px; letter-spacing: 0.3em; text-transform: uppercase; opacity: 0.7; }
+</style>
+</head>
+<body>
+<div id="loader"><div class="spin"></div><div class="loader-text">Loading Field Tool</div></div>
+<div id="root"></div>
+<script type="text/babel" data-type="module">
+const { useState, useMemo } = React;
+
+// ─────────────────────────────────────────────────────────────────
+// CARRIER NOTE: "Ethos / TruStage" — Ethos is the platform,
+// TruStage (CMFG/MEMBERS Life) is the underlying carrier.
+// Same relationship as Instabrain (platform) / Fidelity Life (carrier).
+// TruStage = most lenient UW but lowest agent payout = fallback only.
+//
+// HEALTH CONDITION DATABASE — verified from UW guides
+// Sources: Transamerica FE Express UW Guide (01/26),
+// Corebridge SimpliNow Legacy UW Guide (REV0424),
+// Mutual of Omaha Living Promise FL App,
+// Fidelity Life RAPIDecision Final Expense (OCT 2023),
+// TruStage Life UW Guide 2025 + Health Needs Assessment Guide.
+// Status: "level" | "graded" | "gi_only" | "decline" | "review"
+// ─────────────────────────────────────────────────────────────────
+const CONDITIONS_DB = [
+  {
+    id: "diabetes_type2",
+    label: "Diabetes — Type 2 (controlled, no insulin)",
+    aliases: ["diabetes", "type 2", "t2d", "diabetic", "a1c"],
+    carriers: {
+      Transamerica: { status: "level", note: "Select per single-condition chart." },
+      "Mutual of Omaha": { status: "level", note: "Level if diagnosed at/after age 45 with no complications." },
+      Corebridge: { status: "level", note: "A1C ≤ 8.6 without insulin = Level. 8.7–9.9 = Graded. ≥10 = Decline." },
+      "Fidelity Life": { status: "level", note: "Eligible for Final Expense if no diabetic complications past 2yr." },
+      "Ethos / TruStage": { status: "review", note: "Diabetes (no insulin) past 5yr triggers YES on app. Decision varies by age/coverage." },
+    },
+  },
+  {
+    id: "diabetes_insulin",
+    label: "Diabetes — insulin-dependent",
+    aliases: ["insulin", "insulin dependent", "type 1"],
+    carriers: {
+      Transamerica: { status: "level", note: "Select per single-condition chart." },
+      "Mutual of Omaha": { status: "graded", note: "Graded only. Insulin shock/coma/dialysis = Decline." },
+      Corebridge: { status: "graded", note: "Insulin + A1C ≤ 8.6 = Graded." },
+      "Fidelity Life": { status: "level", note: "Insulin alone OK. Complications past 2yr → GI." },
+      "Ethos / TruStage": { status: "review", note: "Likely route to GAWL (Guaranteed Acceptance) if TAWL/Term decline." },
+    },
+  },
+  {
+    id: "diabetes_complications",
+    label: "Diabetes with complications (PVD, neuropathy, retinopathy, kidney)",
+    aliases: ["diabetic complications", "neuropathy", "retinopathy", "amputation"],
+    carriers: {
+      Transamerica: { status: "level", note: "Diabetes with PVD/neuropathy/retinopathy/kidney: Select." },
+      "Mutual of Omaha": { status: "graded", note: "Graded only. Amputation due to diabetes = Decline." },
+      Corebridge: { status: "decline", note: "Amputation due to diabetic complications = Decline." },
+      "Fidelity Life": { status: "gi_only", note: "Diabetic complications past 2yr → GI." },
+      "Ethos / TruStage": { status: "gi_only", note: "Likely route to GAWL." },
+    },
+  },
+  {
+    id: "copd",
+    label: "COPD / Emphysema / Chronic Bronchitis",
+    aliases: ["copd", "emphysema", "chronic bronchitis", "lung disease"],
+    carriers: {
+      Transamerica: { status: "level", note: "COPD: Select. Comorbid with tobacco/oxygen = Decline." },
+      "Mutual of Omaha": { status: "graded", note: "Chronic lung disease = Graded only (Part Two)." },
+      Corebridge: { status: "graded", note: "COPD non-tobacco = Graded. Tobacco user = Decline. 2x hospitalized 24mo = Decline." },
+      "Fidelity Life": { status: "gi_only", note: "COPD diagnosed/treated past 2yr → GI." },
+      "Ethos / TruStage": { status: "gi_only", note: "COPD = chronic lung condition. TAWL likely declines → route to GAWL." },
+    },
+  },
+  {
+    id: "oxygen",
+    label: "Oxygen Use (supplemental, not for sleep apnea)",
+    aliases: ["oxygen", "o2", "home oxygen", "supplemental oxygen"],
+    carriers: {
+      Transamerica: { status: "graded", note: "O2 within 12mo = Graded. After 12mo = Select." },
+      "Mutual of Omaha": { status: "decline", note: "Currently on oxygen (not sleep apnea) = Decline." },
+      Corebridge: { status: "decline", note: "Currently requires oxygen = Decline." },
+      "Fidelity Life": { status: "gi_only", note: "Currently on oxygen → GI only." },
+      "Ethos / TruStage": { status: "gi_only", note: "Oxygen-dependent = hard knockout for TAWL/Term. GAWL only." },
+    },
+  },
+  {
+    id: "heart_attack",
+    label: "Heart Attack / Myocardial Infarction",
+    aliases: ["heart attack", "mi", "myocardial infarction"],
+    carriers: {
+      Transamerica: { status: "level", note: "Heart attack: Select per single-condition chart." },
+      "Mutual of Omaha": { status: "graded", note: "Within 2yr = Graded. Currently with heart disease 12mo = Decline." },
+      Corebridge: { status: "level", note: "MI 6–24mo non-tobacco = Level. Tobacco = Graded. Within 6mo = Decline." },
+      "Fidelity Life": { status: "gi_only", note: "Heart attack past 2yr → GI." },
+      "Ethos / TruStage": { status: "review", note: "Heart attack alone is NOT on hard decline list. Decision depends on recency + database." },
+    },
+  },
+  {
+    id: "stroke",
+    label: "Stroke / CVA (NOT TIA)",
+    aliases: ["stroke", "cva"],
+    carriers: {
+      Transamerica: { status: "level", note: "Stroke/CVA: Select." },
+      "Mutual of Omaha": { status: "graded", note: "Stroke or TIA within 2yr = Graded only." },
+      Corebridge: { status: "graded", note: "12–24mo = Graded. Within 12mo = Decline." },
+      "Fidelity Life": { status: "gi_only", note: "Stroke past 2yr → GI." },
+      "Ethos / TruStage": { status: "decline", note: "Stroke is on hard decline list — TAWL/Term declined. GAWL only." },
+    },
+  },
+  {
+    id: "tia",
+    label: "TIA — Transient Ischemic Attack (no full stroke)",
+    aliases: ["tia", "transient ischemic", "mini stroke"],
+    carriers: {
+      Transamerica: { status: "level", note: "TIA/CVA: Select." },
+      "Mutual of Omaha": { status: "graded", note: "TIA within 2yr = Graded only." },
+      Corebridge: { status: "graded", note: "TIA within 6mo = Decline. Recurrent TIA = Decline. Otherwise Graded." },
+      "Fidelity Life": { status: "gi_only", note: "TIA past 2yr → GI." },
+      "Ethos / TruStage": { status: "review", note: "TruStage explicitly separates TIA from stroke — answer NO to stroke if only TIA. May still qualify TAWL." },
+    },
+  },
+  {
+    id: "afib",
+    label: "Atrial Fibrillation / Irregular Heartbeat",
+    aliases: ["afib", "atrial fibrillation", "arrhythmia", "irregular heart"],
+    carriers: {
+      Transamerica: { status: "level", note: "AFib/arrhythmia: Select." },
+      "Mutual of Omaha": { status: "graded", note: "Irregular heart rhythm within 2yr = Graded." },
+      Corebridge: { status: "level", note: "Non-chronic AFib + on blood thinner = Level. Without thinner = Graded. Chronic = Graded." },
+      "Fidelity Life": { status: "level", note: "Eligible if no other heart events past 2yr." },
+      "Ethos / TruStage": { status: "review", note: "AFib listed as heart condition on app. Not a hard decline — UW will review." },
+    },
+  },
+  {
+    id: "chf",
+    label: "Congestive Heart Failure (CHF)",
+    aliases: ["chf", "heart failure", "congestive"],
+    carriers: {
+      Transamerica: { status: "level", note: "CHF: Select per single-condition chart (verify comorbidities)." },
+      "Mutual of Omaha": { status: "decline", note: "CHF ever = Decline (Part One Q3a)." },
+      Corebridge: { status: "decline", note: "Heart Failure meds (Entresto, Corlanor) = Decline." },
+      "Fidelity Life": { status: "gi_only", note: "Heart disorder past 2yr → GI." },
+      "Ethos / TruStage": { status: "decline", note: "CHF on hard decline list — TAWL/Term declined. GAWL only." },
+    },
+  },
+  {
+    id: "heart_valve",
+    label: "Heart Valve Replacement / Repair",
+    aliases: ["heart valve", "valve replacement", "valve repair"],
+    carriers: {
+      Transamerica: { status: "level", note: "Cardiac surgery: Select after 12mo." },
+      "Mutual of Omaha": { status: "graded", note: "Valvular heart disease w/ surgical repair past 2yr = Graded." },
+      Corebridge: { status: "review", note: "Not specifically called out — treat as cardiac surgery, varies by recency." },
+      "Fidelity Life": { status: "gi_only", note: "Heart disorder past 2yr → GI." },
+      "Ethos / TruStage": { status: "decline", note: "Heart valve replacement/repair on hard decline list — GAWL only." },
+    },
+  },
+  {
+    id: "kidney_dialysis",
+    label: "Kidney Dialysis / End Stage Renal",
+    aliases: ["dialysis", "kidney failure", "renal", "esrd"],
+    carriers: {
+      Transamerica: { status: "graded", note: "Dialysis within 12mo = Graded. After 12mo = Select." },
+      "Mutual of Omaha": { status: "decline", note: "ESRD or dialysis ever = Decline." },
+      Corebridge: { status: "decline", note: "Advanced/End Stage Renal or needing dialysis = Decline." },
+      "Fidelity Life": { status: "gi_only", note: "Kidney disorder past 2yr → GI." },
+      "Ethos / TruStage": { status: "gi_only", note: "Dialysis = hard knockout for TAWL/Term. GAWL only." },
+    },
+  },
+  {
+    id: "ckd",
+    label: "Chronic Kidney Disease (not on dialysis)",
+    aliases: ["ckd", "chronic kidney", "renal insufficiency"],
+    carriers: {
+      Transamerica: { status: "level", note: "Kidney disorder: Select unless dialysis." },
+      "Mutual of Omaha": { status: "graded", note: "CKD past 4yr = Graded only." },
+      Corebridge: { status: "graded", note: "CKD past 48mo = Graded." },
+      "Fidelity Life": { status: "gi_only", note: "Kidney disorder past 2yr → GI." },
+      "Ethos / TruStage": { status: "review", note: "Not on hard decline list. Listed under kidney conditions — UW reviews." },
+    },
+  },
+  {
+    id: "cancer_recent",
+    label: "Cancer — diagnosed/treated within 2 years",
+    aliases: ["cancer", "recent cancer", "tumor", "malignancy"],
+    carriers: {
+      Transamerica: { status: "decline", note: "Treatment within 2yr = Decline. Never treated = Decline." },
+      "Mutual of Omaha": { status: "decline", note: "Cancer past 2yr = Decline (Part One Q5)." },
+      Corebridge: { status: "decline", note: "Most internal cancers within 24mo = Decline." },
+      "Fidelity Life": { status: "gi_only", note: "Cancer past 2yr (except basal cell) → GI." },
+      "Ethos / TruStage": { status: "decline", note: "Cancer (non-skin) on hard decline list — GAWL only." },
+    },
+  },
+  {
+    id: "cancer_2_4yr",
+    label: "Cancer — last treated 2–4 years ago",
+    aliases: ["cancer 3 years", "cancer remission"],
+    carriers: {
+      Transamerica: { status: "graded", note: "Last treatment 2–4yr ago = Graded." },
+      "Mutual of Omaha": { status: "graded", note: "Cancer past 4yr = Graded only (Part Two)." },
+      Corebridge: { status: "level", note: "Many Stage I cancers within 48mo = Level; Stage II = Graded." },
+      "Fidelity Life": { status: "level", note: "Past 2yr clean = eligible for Final Expense." },
+      "Ethos / TruStage": { status: "review", note: "Hard decline applies broadly to cancer history — verify with UW. Likely GAWL safer." },
+    },
+  },
+  {
+    id: "cancer_4plus",
+    label: "Cancer — 4+ years remission",
+    aliases: ["cancer remission", "cancer survivor", "cancer history"],
+    carriers: {
+      Transamerica: { status: "level", note: "Last treatment over 4yr ago = Select." },
+      "Mutual of Omaha": { status: "level", note: "Past 4yr clean = Level Benefit eligible." },
+      Corebridge: { status: "level", note: "Beyond 48mo, most cancers eligible." },
+      "Fidelity Life": { status: "level", note: "Eligible for Final Expense." },
+      "Ethos / TruStage": { status: "review", note: "Cancer on hard decline list regardless of recency — GAWL is safer route." },
+    },
+  },
+  {
+    id: "metastatic",
+    label: "Metastatic / Recurrent / Stage III–IV Cancer",
+    aliases: ["metastatic", "stage iv", "stage 4", "recurrent cancer"],
+    carriers: {
+      Transamerica: { status: "decline", note: "Metastatic, recurrent, multi-site = Decline ever." },
+      "Mutual of Omaha": { status: "decline", note: "Metastatic/recurrent ever = Decline." },
+      Corebridge: { status: "decline", note: "Stage III/IV or recurrent = Decline." },
+      "Fidelity Life": { status: "gi_only", note: "GI route only." },
+      "Ethos / TruStage": { status: "gi_only", note: "GAWL only — no underwriting required." },
+    },
+  },
+  {
+    id: "alzheimers",
+    label: "Alzheimer's / Dementia / Memory Loss",
+    aliases: ["alzheimer", "dementia", "memory loss", "cognitive"],
+    carriers: {
+      Transamerica: { status: "decline", note: "Alzheimer's, dementia, memory loss = Decline ever." },
+      "Mutual of Omaha": { status: "decline", note: "Alzheimer's or Dementia ever = Decline." },
+      Corebridge: { status: "decline", note: "Alzheimer's/Dementia ever = Decline. Memory drugs = Decline." },
+      "Fidelity Life": { status: "gi_only", note: "Cognitive impairment any degree past 2yr → GI." },
+      "Ethos / TruStage": { status: "decline", note: "On hard decline list — GAWL only (no UW)." },
+    },
+  },
+  {
+    id: "als",
+    label: "ALS / Lou Gehrig's Disease",
+    aliases: ["als", "lou gehrig", "amyotrophic"],
+    carriers: {
+      Transamerica: { status: "decline", note: "ALS ever = Decline." },
+      "Mutual of Omaha": { status: "decline", note: "Lou Gehrig's ever = Decline." },
+      Corebridge: { status: "decline", note: "ALS ever = Decline." },
+      "Fidelity Life": { status: "gi_only", note: "ALS past 2yr → GI." },
+      "Ethos / TruStage": { status: "decline", note: "ALS on hard decline list — GAWL only." },
+    },
+  },
+  {
+    id: "parkinsons",
+    label: "Parkinson's Disease",
+    aliases: ["parkinson"],
+    carriers: {
+      Transamerica: { status: "level", note: "Parkinson's: Select." },
+      "Mutual of Omaha": { status: "graded", note: "Parkinson's past 4yr = Graded only." },
+      Corebridge: { status: "graded", note: "Parkinson's ever = Graded." },
+      "Fidelity Life": { status: "level", note: "Not specifically excluded if outside other 2yr triggers." },
+      "Ethos / TruStage": { status: "review", note: "Listed as brain/spinal nerve disorder — UW reviews. Not a hard decline." },
+    },
+  },
+  {
+    id: "ms",
+    label: "Multiple Sclerosis (MS)",
+    aliases: ["ms", "multiple sclerosis"],
+    carriers: {
+      Transamerica: { status: "level", note: "MS: Select." },
+      "Mutual of Omaha": { status: "graded", note: "MS past 4yr = Graded only." },
+      Corebridge: { status: "graded", note: "MS ever = Graded." },
+      "Fidelity Life": { status: "level", note: "Not specifically excluded." },
+      "Ethos / TruStage": { status: "review", note: "Listed as brain/spinal nerve disorder — UW reviews." },
+    },
+  },
+  {
+    id: "hiv",
+    label: "HIV / AIDS / ARC",
+    aliases: ["hiv", "aids", "arc"],
+    carriers: {
+      Transamerica: { status: "decline", note: "HIV/AIDS ever = Decline." },
+      "Mutual of Omaha": { status: "decline", note: "HIV/AIDS/ARC ever = Decline." },
+      Corebridge: { status: "decline", note: "HIV, AIDS, ARC ever = Decline." },
+      "Fidelity Life": { status: "decline", note: "HIV ever = Decline (FE Q4). No GI either." },
+      "Ethos / TruStage": { status: "decline", note: "HIV/AIDS/ARC on hard decline list — GAWL only." },
+    },
+  },
+  {
+    id: "hep_c",
+    label: "Hepatitis C",
+    aliases: ["hep c", "hepatitis c", "hcv"],
+    carriers: {
+      Transamerica: { status: "level", note: "Hepatitis B or C: Select." },
+      "Mutual of Omaha": { status: "graded", note: "Hep C ever = Graded only (Part Two Q6c)." },
+      Corebridge: { status: "graded", note: "Hep B = Graded. Hep C verify with UW." },
+      "Fidelity Life": { status: "level", note: "Liver disorder past 2yr → GI; otherwise eligible." },
+      "Ethos / TruStage": { status: "review", note: "Not on hard decline list. UW reviews based on database." },
+    },
+  },
+  {
+    id: "cirrhosis",
+    label: "Cirrhosis / Liver Failure",
+    aliases: ["cirrhosis", "liver failure"],
+    carriers: {
+      Transamerica: { status: "graded", note: "Cirrhosis ever = Graded. Liver failure ever = Graded." },
+      "Mutual of Omaha": { status: "decline", note: "Cirrhosis ever = Decline (Part One Q3a)." },
+      Corebridge: { status: "decline", note: "Liver Cirrhosis ever = Decline." },
+      "Fidelity Life": { status: "gi_only", note: "Liver disorder past 2yr → GI." },
+      "Ethos / TruStage": { status: "decline", note: "Cirrhosis on hard decline list — GAWL only." },
+    },
+  },
+  {
+    id: "organ_transplant",
+    label: "Organ / Bone Marrow Transplant",
+    aliases: ["transplant", "organ transplant", "bone marrow"],
+    carriers: {
+      Transamerica: { status: "decline", note: "Organ transplant ever = Decline." },
+      "Mutual of Omaha": { status: "decline", note: "Organ or bone marrow transplant ever = Decline." },
+      Corebridge: { status: "decline", note: "Organ/Bone Marrow Transplant ever = Decline." },
+      "Fidelity Life": { status: "gi_only", note: "Organ transplant past 2yr → GI." },
+      "Ethos / TruStage": { status: "review", note: "Not explicitly on decline list — likely UW review with anti-rejection meds." },
+    },
+  },
+  {
+    id: "nursing_home",
+    label: "Nursing Home / ADL Assistance / Bedridden",
+    aliases: ["nursing home", "adl", "bedridden", "hospice", "wheelchair"],
+    carriers: {
+      Transamerica: { status: "decline", note: "Bedridden, NH, hospice, wheelchair w/in 12mo = Decline." },
+      "Mutual of Omaha": { status: "decline", note: "Bedridden, NH, hospice, ADL assistance, wheelchair = Decline." },
+      Corebridge: { status: "decline", note: "All facility confinement, ADL, paraplegia/quadriplegia = Decline." },
+      "Fidelity Life": { status: "gi_only", note: "Currently in NH/ALF → GI." },
+      "Ethos / TruStage": { status: "gi_only", note: "ADL inability + currently in NH = hard knockouts. GAWL only." },
+    },
+  },
+  {
+    id: "terminal",
+    label: "Terminal Illness (life expectancy ≤ 12-24 months)",
+    aliases: ["terminal", "terminal illness", "life expectancy"],
+    carriers: {
+      Transamerica: { status: "decline", note: "Life expectancy ≤ 12mo = Decline." },
+      "Mutual of Omaha": { status: "decline", note: "Terminal ≤ 12mo = Decline." },
+      Corebridge: { status: "decline", note: "Terminal ≤ 12mo = Decline." },
+      "Fidelity Life": { status: "decline", note: "Life expectancy ≤ 24mo = Decline. No GI either." },
+      "Ethos / TruStage": { status: "review", note: "Not explicitly on decline list, but UW database will likely catch terminal dx." },
+    },
+  },
+  {
+    id: "bipolar",
+    label: "Bipolar / Schizophrenia / Psychosis",
+    aliases: ["bipolar", "schizophrenia", "manic depressive", "psychosis"],
+    carriers: {
+      Transamerica: { status: "level", note: "Select. Inpatient mental health past 2yr = Graded." },
+      "Mutual of Omaha": { status: "graded", note: "Bipolar/Schizophrenia past 4yr = Graded only." },
+      Corebridge: { status: "graded", note: "Bipolar past 48mo = Graded. Schizophrenia ever = Graded; recent psychosis = Decline." },
+      "Fidelity Life": { status: "level", note: "Mental hospitalization past 2yr → GI; otherwise eligible." },
+      "Ethos / TruStage": { status: "decline", note: "Schizophrenia/Psychosis on hard decline list. Bipolar listed under mental disorders — UW reviews." },
+    },
+  },
+  {
+    id: "depression",
+    label: "Depression / Anxiety / PTSD",
+    aliases: ["depression", "anxiety", "ptsd"],
+    carriers: {
+      Transamerica: { status: "level", note: "Depression/PTSD: Select." },
+      "Mutual of Omaha": { status: "level", note: "Not on decline lists — Level eligible if no inpatient hospitalization 2yr." },
+      Corebridge: { status: "level", note: "Generally Level if no hospitalization for psychotic event 36mo." },
+      "Fidelity Life": { status: "level", note: "Eligible unless mental hospitalization past 2yr." },
+      "Ethos / TruStage": { status: "review", note: "Chronic depression (>6mo treatment) triggers YES on app — UW reviews." },
+    },
+  },
+  {
+    id: "felony",
+    label: "Felony / DUI / Recent Conviction",
+    aliases: ["felony", "dui", "dwi", "incarcerated", "prison"],
+    carriers: {
+      Transamerica: { status: "decline", note: "Felony or DUI within 2yr = Decline. After 2yr = Select." },
+      "Mutual of Omaha": { status: "graded", note: "Felony or DUI within 2yr = Graded only." },
+      Corebridge: { status: "decline", note: "DUI/felony past 24mo = Decline. Currently incarcerated = Decline." },
+      "Fidelity Life": { status: "gi_only", note: "Felony or DUI past 5yr → GI." },
+      "Ethos / TruStage": { status: "gi_only", note: "Currently incarcerated = hard knockout. GAWL only." },
+    },
+  },
+  {
+    id: "drug_alcohol",
+    label: "Drug / Alcohol Abuse Treatment",
+    aliases: ["drug abuse", "alcohol", "substance", "rehab", "addiction"],
+    carriers: {
+      Transamerica: { status: "decline", note: "Treatment within 2yr = Decline. After 2yr = Select." },
+      "Mutual of Omaha": { status: "graded", note: "Treatment within 2yr = Graded only. Illegal drug use 2yr = Graded." },
+      Corebridge: { status: "graded", note: "Substance abuse 24mo = Graded. Hard narcotics 24mo = Decline." },
+      "Fidelity Life": { status: "gi_only", note: "Drug/alcohol counseling past 2yr → GI." },
+      "Ethos / TruStage": { status: "decline", note: "Alcohol/drug abuse on hard decline list — GAWL only." },
+    },
+  },
+  {
+    id: "sickle_cell",
+    label: "Sickle Cell Anemia",
+    aliases: ["sickle cell"],
+    carriers: {
+      Transamerica: { status: "decline", note: "Sickle cell anemia ever = Decline." },
+      "Mutual of Omaha": { status: "decline", note: "Sickle Cell Anemia ever = Decline." },
+      Corebridge: { status: "decline", note: "Sickle Cell Anemia ever = Decline." },
+      "Fidelity Life": { status: "level", note: "Not specifically excluded — verify with carrier." },
+      "Ethos / TruStage": { status: "review", note: "Not on hard decline list. UW reviews via database." },
+    },
+  },
+  {
+    id: "pulmonary_fibrosis",
+    label: "Pulmonary Fibrosis",
+    aliases: ["pulmonary fibrosis", "ipf"],
+    carriers: {
+      Transamerica: { status: "decline", note: "Cystic or pulmonary fibrosis ever = Decline." },
+      "Mutual of Omaha": { status: "graded", note: "Chronic lung disease past 4yr = Graded only." },
+      Corebridge: { status: "decline", note: "Pulmonary fibrosis meds (Ofev, Esbriet) = Decline." },
+      "Fidelity Life": { status: "gi_only", note: "Respiratory disorder past 2yr → GI." },
+      "Ethos / TruStage": { status: "decline", note: "Pulmonary fibrosis on hard decline list — GAWL only." },
+    },
+  },
+];
+
+// ─────────────────────────────────────────────────────────────────
+// MEDICATION DATABASE — verified from MOO and Transamerica drug lists
+// ─────────────────────────────────────────────────────────────────
+const MEDICATIONS_DB = [
+  { name: "Aricept", generic: "Donepezil", condition: "Memory loss / Dementia", carriers: { Transamerica: "decline", "Mutual of Omaha": "decline", Corebridge: "decline", "Ethos / TruStage": "decline" } },
+  { name: "Donepezil", generic: "Donepezil", condition: "Memory loss / Dementia", carriers: { Transamerica: "decline", "Mutual of Omaha": "decline", Corebridge: "decline", "Ethos / TruStage": "decline" } },
+  { name: "Namenda", generic: "Memantine", condition: "Memory loss / Dementia", carriers: { Transamerica: "decline", "Mutual of Omaha": "decline", Corebridge: "decline", "Ethos / TruStage": "decline" } },
+  { name: "Memantine", generic: "Memantine", condition: "Memory loss / Dementia", carriers: { Transamerica: "decline", "Mutual of Omaha": "decline", Corebridge: "decline", "Ethos / TruStage": "decline" } },
+  { name: "Exelon", generic: "Rivastigmine", condition: "Memory loss / Dementia", carriers: { Transamerica: "decline", "Mutual of Omaha": "decline", Corebridge: "decline", "Ethos / TruStage": "decline" } },
+  { name: "Razadyne", generic: "Galantamine", condition: "Memory loss / Dementia", carriers: { Transamerica: "decline", "Mutual of Omaha": "decline", Corebridge: "decline", "Ethos / TruStage": "decline" } },
+
+  { name: "Atripla", generic: "Efavirenz/Emtricitabine/Tenofovir", condition: "HIV", carriers: { Transamerica: "decline", "Mutual of Omaha": "decline", Corebridge: "decline", "Ethos / TruStage": "decline" } },
+  { name: "Biktarvy", generic: "Bictegravir/Emtricitabine/Tenofovir", condition: "HIV", carriers: { Transamerica: "decline", "Mutual of Omaha": "decline", Corebridge: "decline", "Ethos / TruStage": "decline" } },
+  { name: "Genvoya", generic: "Elvitegravir/Cobicistat", condition: "HIV", carriers: { Transamerica: "decline", "Mutual of Omaha": "decline", Corebridge: "decline", "Ethos / TruStage": "decline" } },
+  { name: "Triumeq", generic: "Abacavir/Dolutegravir/Lamivudine", condition: "HIV", carriers: { Transamerica: "decline", "Mutual of Omaha": "decline", Corebridge: "decline", "Ethos / TruStage": "decline" } },
+  { name: "Isentress", generic: "Raltegravir", condition: "HIV", carriers: { Transamerica: "decline", "Mutual of Omaha": "decline", Corebridge: "decline", "Ethos / TruStage": "decline" } },
+  { name: "Norvir", generic: "Ritonavir", condition: "HIV", carriers: { Transamerica: "decline", "Mutual of Omaha": "decline", Corebridge: "decline", "Ethos / TruStage": "decline" } },
+
+  { name: "Keytruda", generic: "Pembrolizumab", condition: "Active cancer treatment", carriers: { Transamerica: "decline", "Mutual of Omaha": "decline", Corebridge: "decline", "Ethos / TruStage": "decline" } },
+  { name: "Revlimid", generic: "Lenalidomide", condition: "Multiple myeloma", carriers: { Transamerica: "decline", "Mutual of Omaha": "decline", Corebridge: "decline", "Ethos / TruStage": "decline" } },
+  { name: "Imbruvica", generic: "Ibrutinib", condition: "Cancer", carriers: { Transamerica: "decline", "Mutual of Omaha": "graded", Corebridge: "decline", "Ethos / TruStage": "decline" } },
+  { name: "Lupron", generic: "Leuprolide", condition: "Prostate/breast cancer", carriers: { Transamerica: "decline", "Mutual of Omaha": "decline", Corebridge: "decline", "Ethos / TruStage": "decline" } },
+  { name: "Casodex", generic: "Bicalutamide", condition: "Prostate cancer", carriers: { Transamerica: "decline", "Mutual of Omaha": "decline", Corebridge: "decline", "Ethos / TruStage": "decline" } },
+  { name: "Tamoxifen", generic: "Tamoxifen", condition: "Breast cancer (review required)", carriers: { Transamerica: "graded", "Mutual of Omaha": "review", Corebridge: "review", "Ethos / TruStage": "review" } },
+
+  { name: "Prograf", generic: "Tacrolimus", condition: "Organ transplant", carriers: { Transamerica: "decline", "Mutual of Omaha": "decline", Corebridge: "decline", "Ethos / TruStage": "review" } },
+  { name: "Cellcept", generic: "Mycophenolate", condition: "Organ transplant", carriers: { Transamerica: "decline", "Mutual of Omaha": "decline", Corebridge: "decline", "Ethos / TruStage": "review" } },
+  { name: "Cyclosporine", generic: "Cyclosporine", condition: "Organ transplant", carriers: { Transamerica: "decline", "Mutual of Omaha": "decline", Corebridge: "decline", "Ethos / TruStage": "review" } },
+  { name: "Rapamune", generic: "Sirolimus", condition: "Organ transplant", carriers: { Transamerica: "decline", "Mutual of Omaha": "decline", Corebridge: "decline", "Ethos / TruStage": "review" } },
+
+  { name: "Suboxone", generic: "Buprenorphine/Naloxone", condition: "Opioid dependence", carriers: { Transamerica: "decline", "Mutual of Omaha": "graded", Corebridge: "decline", "Ethos / TruStage": "decline" } },
+  { name: "Subutex", generic: "Buprenorphine", condition: "Opioid dependence", carriers: { Transamerica: "decline", "Mutual of Omaha": "review", Corebridge: "decline", "Ethos / TruStage": "decline" } },
+  { name: "Methadone", generic: "Methadone", condition: "Opioid dependence / chronic pain", carriers: { Transamerica: "review", "Mutual of Omaha": "review", Corebridge: "decline", "Ethos / TruStage": "decline" } },
+  { name: "Vivitrol", generic: "Naltrexone", condition: "Alcohol/opioid dependence", carriers: { Transamerica: "decline", "Mutual of Omaha": "graded", Corebridge: "decline", "Ethos / TruStage": "decline" } },
+  { name: "Antabuse", generic: "Disulfiram", condition: "Alcohol dependence", carriers: { Transamerica: "decline", "Mutual of Omaha": "graded", Corebridge: "decline", "Ethos / TruStage": "decline" } },
+  { name: "Campral", generic: "Acamprosate", condition: "Alcohol dependence", carriers: { Transamerica: "decline", "Mutual of Omaha": "graded", Corebridge: "decline", "Ethos / TruStage": "decline" } },
+
+  { name: "Entresto", generic: "Sacubitril/Valsartan", condition: "Heart failure", carriers: { Transamerica: "review", "Mutual of Omaha": "decline", Corebridge: "decline", "Ethos / TruStage": "decline" } },
+  { name: "Corlanor", generic: "Ivabradine", condition: "Heart failure", carriers: { Transamerica: "review", "Mutual of Omaha": "decline", Corebridge: "decline", "Ethos / TruStage": "decline" } },
+
+  { name: "Daliresp", generic: "Roflumilast", condition: "Severe COPD", carriers: { Transamerica: "decline", "Mutual of Omaha": "graded", Corebridge: "decline", "Ethos / TruStage": "review" } },
+  { name: "Trelegy Ellipta", generic: "Fluticasone/Umeclidinium/Vilanterol", condition: "COPD", carriers: { Transamerica: "review", "Mutual of Omaha": "review", Corebridge: "decline", "Ethos / TruStage": "review" } },
+  { name: "Spiriva", generic: "Tiotropium", condition: "COPD", carriers: { Transamerica: "review", "Mutual of Omaha": "graded", Corebridge: "review", "Ethos / TruStage": "review" } },
+
+  { name: "Ofev", generic: "Nintedanib", condition: "Pulmonary fibrosis", carriers: { Transamerica: "decline", "Mutual of Omaha": "review", Corebridge: "decline", "Ethos / TruStage": "decline" } },
+  { name: "Tyvaso", generic: "Treprostinil", condition: "Pulmonary hypertension", carriers: { Transamerica: "review", "Mutual of Omaha": "review", Corebridge: "decline", "Ethos / TruStage": "decline" } },
+
+  { name: "Eliquis", generic: "Apixaban", condition: "Anticoagulation (AFib, clots)", carriers: { Transamerica: "review", "Mutual of Omaha": "review", Corebridge: "review", "Ethos / TruStage": "review" } },
+  { name: "Xarelto", generic: "Rivaroxaban", condition: "Anticoagulation", carriers: { Transamerica: "review", "Mutual of Omaha": "review", Corebridge: "review", "Ethos / TruStage": "review" } },
+  { name: "Plavix", generic: "Clopidogrel", condition: "Post-stent / heart disease", carriers: { Transamerica: "review", "Mutual of Omaha": "review", Corebridge: "review", "Ethos / TruStage": "review" } },
+  { name: "Coumadin", generic: "Warfarin", condition: "Anticoagulation", carriers: { Transamerica: "review", "Mutual of Omaha": "review", Corebridge: "review", "Ethos / TruStage": "review" } },
+  { name: "Brilinta", generic: "Ticagrelor", condition: "Post-stent / CAD", carriers: { Transamerica: "review", "Mutual of Omaha": "review", Corebridge: "decline", "Ethos / TruStage": "review" } },
+
+  { name: "Seroquel", generic: "Quetiapine", condition: "Mental health (review)", carriers: { Transamerica: "review", "Mutual of Omaha": "review", Corebridge: "review", "Ethos / TruStage": "review" } },
+  { name: "Abilify", generic: "Aripiprazole", condition: "Mental health (review)", carriers: { Transamerica: "review", "Mutual of Omaha": "review", Corebridge: "review", "Ethos / TruStage": "review" } },
+  { name: "Clozapine", generic: "Clozapine", condition: "Schizophrenia", carriers: { Transamerica: "graded", "Mutual of Omaha": "decline", Corebridge: "graded", "Ethos / TruStage": "decline" } },
+  { name: "Lithium", generic: "Lithium", condition: "Bipolar", carriers: { Transamerica: "graded", "Mutual of Omaha": "decline", Corebridge: "graded", "Ethos / TruStage": "review" } },
+];
+
+const STATUS_META = {
+  level: { label: "LEVEL", color: "text-cyan-300", bg: "bg-cyan-500/10", border: "border-cyan-500/30" },
+  graded: { label: "GRADED", color: "text-amber-300", bg: "bg-amber-500/10", border: "border-amber-500/30" },
+  gi_only: { label: "GI ONLY", color: "text-orange-300", bg: "bg-orange-500/10", border: "border-orange-500/30" },
+  decline: { label: "DECLINE", color: "text-red-400", bg: "bg-red-500/10", border: "border-red-500/30" },
+  review: { label: "REVIEW", color: "text-slate-300", bg: "bg-slate-500/10", border: "border-slate-500/30" },
+};
+
+// ─────────────────────────────────────────────────────────────────
+// BUILD CHARTS — verified from carrier UW guides
+// Format: height in inches → carrier-specific weight rules
+// ─────────────────────────────────────────────────────────────────
+
+// Transamerica: BMI-based. Select 18.5–46.0, Graded 15.0–18.499 OR 46.001–48.0
+// Source: Transamerica FE Express UW Guide pg 14
+const TRANS_BUILD = {
+  56: { sLow: 83, sHigh: 205, gLow1: 67, gHigh1: 82, gLow2: 206, gHigh2: 214 },
+  57: { sLow: 86, sHigh: 212, gLow1: 70, gHigh1: 85, gLow2: 213, gHigh2: 221 },
+  58: { sLow: 89, sHigh: 220, gLow1: 72, gHigh1: 88, gLow2: 221, gHigh2: 229 },
+  59: { sLow: 92, sHigh: 227, gLow1: 75, gHigh1: 91, gLow2: 228, gHigh2: 237 },
+  60: { sLow: 95, sHigh: 235, gLow1: 77, gHigh1: 94, gLow2: 236, gHigh2: 245 },
+  61: { sLow: 98, sHigh: 243, gLow1: 80, gHigh1: 97, gLow2: 244, gHigh2: 254 },
+  62: { sLow: 102, sHigh: 251, gLow1: 83, gHigh1: 101, gLow2: 252, gHigh2: 262 },
+  63: { sLow: 105, sHigh: 259, gLow1: 85, gHigh1: 104, gLow2: 260, gHigh2: 270 },
+  64: { sLow: 108, sHigh: 268, gLow1: 88, gHigh1: 107, gLow2: 269, gHigh2: 279 },
+  65: { sLow: 112, sHigh: 276, gLow1: 91, gHigh1: 111, gLow2: 277, gHigh2: 288 },
+  66: { sLow: 115, sHigh: 285, gLow1: 93, gHigh1: 114, gLow2: 286, gHigh2: 297 },
+  67: { sLow: 119, sHigh: 293, gLow1: 96, gHigh1: 118, gLow2: 294, gHigh2: 306 },
+  68: { sLow: 122, sHigh: 302, gLow1: 99, gHigh1: 121, gLow2: 303, gHigh2: 315 },
+  69: { sLow: 126, sHigh: 311, gLow1: 102, gHigh1: 125, gLow2: 312, gHigh2: 325 },
+  70: { sLow: 129, sHigh: 320, gLow1: 105, gHigh1: 128, gLow2: 321, gHigh2: 334 },
+  71: { sLow: 133, sHigh: 329, gLow1: 108, gHigh1: 132, gLow2: 330, gHigh2: 344 },
+  72: { sLow: 137, sHigh: 339, gLow1: 111, gHigh1: 136, gLow2: 340, gHigh2: 353 },
+  73: { sLow: 141, sHigh: 348, gLow1: 114, gHigh1: 140, gLow2: 349, gHigh2: 363 },
+  74: { sLow: 145, sHigh: 358, gLow1: 117, gHigh1: 144, gLow2: 359, gHigh2: 373 },
+  75: { sLow: 149, sHigh: 368, gLow1: 121, gHigh1: 148, gLow2: 369, gHigh2: 384 },
+  76: { sLow: 152, sHigh: 377, gLow1: 124, gHigh1: 151, gLow2: 378, gHigh2: 394 },
+  77: { sLow: 157, sHigh: 387, gLow1: 127, gHigh1: 156, gLow2: 388, gHigh2: 404 },
+  78: { sLow: 161, sHigh: 398, gLow1: 130, gHigh1: 160, gLow2: 399, gHigh2: 415 },
+  79: { sLow: 165, sHigh: 408, gLow1: 134, gHigh1: 164, gLow2: 409, gHigh2: 426 },
+  80: { sLow: 169, sHigh: 418, gLow1: 137, gHigh1: 168, gLow2: 419, gHigh2: 436 },
+  81: { sLow: 173, sHigh: 429, gLow1: 140, gHigh1: 172, gLow2: 430, gHigh2: 447 },
+  82: { sLow: 177, sHigh: 439, gLow1: 144, gHigh1: 176, gLow2: 440, gHigh2: 459 },
+  83: { sLow: 182, sHigh: 450, gLow1: 147, gHigh1: 181, gLow2: 451, gHigh2: 470 },
+  84: { sLow: 186, sHigh: 461, gLow1: 151, gHigh1: 185, gLow2: 462, gHigh2: 481 },
+};
+
+// Fidelity Life: hard min/max per height (single-tier, eligible or not)
+// Source: Fidelity Life RAPIDecision Final Expense pg 4
+const FIDELITY_BUILD = {
+  56: { min: 74, max: 330 }, 57: { min: 76, max: 334 }, 58: { min: 79, max: 337 },
+  59: { min: 82, max: 341 }, 60: { min: 84, max: 346 }, 61: { min: 87, max: 351 },
+  62: { min: 90, max: 357 }, 63: { min: 93, max: 365 }, 64: { min: 96, max: 372 },
+  65: { min: 99, max: 379 }, 66: { min: 102, max: 387 }, 67: { min: 105, max: 396 },
+  68: { min: 109, max: 404 }, 69: { min: 112, max: 413 }, 70: { min: 115, max: 420 },
+  71: { min: 118, max: 428 }, 72: { min: 122, max: 437 }, 73: { min: 125, max: 445 },
+  74: { min: 129, max: 454 }, 75: { min: 132, max: 464 }, 76: { min: 136, max: 473 },
+  77: { min: 139, max: 483 }, 78: { min: 143, max: 492 }, 79: { min: 146, max: 500 },
+  80: { min: 150, max: 507 }, 81: { min: 154, max: 515 },
+};
+
+// Corebridge: TWO TIERS — Legacy Max (Level) is tighter, Legacy (Graded) is wider
+// Source: Corebridge SimpliNow Legacy UW Guide pg 8
+const COREBRIDGE_BUILD = {
+  56: { gMin: 74, gMax: 203, mMin: 79, mMax: 189 },
+  57: { gMin: 77, gMax: 210, mMin: 81, mMax: 196 },
+  58: { gMin: 79, gMax: 217, mMin: 84, mMax: 203 },
+  59: { gMin: 82, gMax: 225, mMin: 87, mMax: 210 },
+  60: { gMin: 85, gMax: 232, mMin: 90, mMax: 217 },
+  61: { gMin: 88, gMax: 240, mMin: 93, mMax: 224 },
+  62: { gMin: 91, gMax: 248, mMin: 96, mMax: 232 },
+  63: { gMin: 94, gMax: 256, mMin: 99, mMax: 239 },
+  64: { gMin: 97, gMax: 265, mMin: 103, mMax: 247 },
+  65: { gMin: 100, gMax: 273, mMin: 106, mMax: 255 },
+  66: { gMin: 103, gMax: 281, mMin: 109, mMax: 263 },
+  67: { gMin: 106, gMax: 290, mMin: 112, mMax: 271 },
+  68: { gMin: 109, gMax: 299, mMin: 116, mMax: 279 },
+  69: { gMin: 112, gMax: 307, mMin: 119, mMax: 287 },
+  70: { gMin: 116, gMax: 316, mMin: 123, mMax: 296 },
+  71: { gMin: 119, gMax: 326, mMin: 126, mMax: 304 },
+  72: { gMin: 122, gMax: 335, mMin: 130, mMax: 313 },
+  73: { gMin: 126, gMax: 344, mMin: 133, mMax: 321 },
+  74: { gMin: 129, gMax: 354, mMin: 137, mMax: 330 },
+  75: { gMin: 133, gMax: 363, mMin: 141, mMax: 339 },
+  76: { gMin: 136, gMax: 373, mMin: 145, mMax: 348 },
+  77: { gMin: 140, gMax: 383, mMin: 148, mMax: 358 },
+  78: { gMin: 144, gMax: 393, mMin: 152, mMax: 367 },
+  79: { gMin: 147, gMax: 403, mMin: 156, mMax: 376 },
+  80: { gMin: 151, gMax: 413, mMin: 160, mMax: 386 },
+  81: { gMin: 155, gMax: 424, mMin: 164, mMax: 396 },
+  82: { gMin: 159, gMax: 434, mMin: 168, mMax: 406 },
+};
+
+// Mutual of Omaha: Living Promise has separate Level and Graded max weight columns
+// Source: MOO Express Life Products Reference Guide (27857_0426)
+const MOO_BUILD = {
+  56: { min: 74, levelMax: 204, gradedMax: 221 },
+  57: { min: 77, levelMax: 209, gradedMax: 225 },
+  58: { min: 79, levelMax: 214, gradedMax: 231 },
+  59: { min: 82, levelMax: 220, gradedMax: 237 },
+  60: { min: 85, levelMax: 226, gradedMax: 244 },
+  61: { min: 88, levelMax: 233, gradedMax: 250 },
+  62: { min: 91, levelMax: 239, gradedMax: 257 },
+  63: { min: 94, levelMax: 246, gradedMax: 264 },
+  64: { min: 97, levelMax: 252, gradedMax: 270 },
+  65: { min: 100, levelMax: 259, gradedMax: 277 },
+  66: { min: 103, levelMax: 268, gradedMax: 285 },
+  67: { min: 106, levelMax: 275, gradedMax: 293 },
+  68: { min: 109, levelMax: 283, gradedMax: 300 },
+  69: { min: 112, levelMax: 291, gradedMax: 309 },
+  70: { min: 115, levelMax: 300, gradedMax: 316 },
+  71: { min: 119, levelMax: 307, gradedMax: 325 },
+  72: { min: 122, levelMax: 315, gradedMax: 333 },
+  73: { min: 126, levelMax: 322, gradedMax: 340 },
+  74: { min: 129, levelMax: 331, gradedMax: 349 },
+  75: { min: 133, levelMax: 339, gradedMax: 358 },
+  76: { min: 136, levelMax: 348, gradedMax: 367 },
+  77: { min: 140, levelMax: 357, gradedMax: 376 },
+  78: { min: 143, levelMax: 366, gradedMax: 385 },
+  79: { min: 147, levelMax: 375, gradedMax: 394 },
+  80: { min: 151, levelMax: 385, gradedMax: 405 },
+  81: { min: 154, levelMax: 395, gradedMax: 415 },
+  82: { min: 158, levelMax: 407, gradedMax: 427 },
+};
+
+// Helper: convert ft/in to total inches
+function toInches(ft, inch) {
+  return parseInt(ft, 10) * 12 + parseInt(inch, 10);
+}
+
+// Helper: format inches back to ft'in"
+function formatHeight(totalInches) {
+  const ft = Math.floor(totalInches / 12);
+  const inch = totalInches % 12;
+  return `${ft}'${inch}"`;
+}
+
+// Build chart evaluator — returns disposition per carrier
+function evaluateBuild(heightInches, weight) {
+  const results = {};
+
+  // Transamerica
+  const t = TRANS_BUILD[heightInches];
+  if (!t) {
+    results.Transamerica = { status: "decline", note: "Height outside chart (4'8\"-7')." };
+  } else if (weight >= t.sLow && weight <= t.sHigh) {
+    results.Transamerica = { status: "level", note: `Select range: ${t.sLow}-${t.sHigh} lbs.` };
+  } else if ((weight >= t.gLow1 && weight <= t.gHigh1) || (weight >= t.gLow2 && weight <= t.gHigh2)) {
+    results.Transamerica = { status: "graded", note: `Graded range: ${t.gLow1}-${t.gHigh1} or ${t.gLow2}-${t.gHigh2} lbs.` };
+  } else {
+    results.Transamerica = { status: "decline", note: `Outside all bands. Select: ${t.sLow}-${t.sHigh}, Graded edges: ${t.gLow1}-${t.gHigh1} / ${t.gLow2}-${t.gHigh2}.` };
+  }
+
+  // Fidelity Life
+  const f = FIDELITY_BUILD[heightInches];
+  if (!f) {
+    results["Fidelity Life"] = { status: "decline", note: "Height outside chart (4'8\"-6'9\")." };
+  } else if (weight >= f.min && weight <= f.max) {
+    results["Fidelity Life"] = { status: "level", note: `Eligible range: ${f.min}-${f.max} lbs.` };
+  } else {
+    results["Fidelity Life"] = { status: "decline", note: `Outside ${f.min}-${f.max} lbs. No graded option for Final Expense — route to GI.` };
+  }
+
+  // Corebridge
+  const c = COREBRIDGE_BUILD[heightInches];
+  if (!c) {
+    results.Corebridge = { status: "decline", note: "Height outside chart (4'8\"-6'10\")." };
+  } else if (weight >= c.mMin && weight <= c.mMax) {
+    results.Corebridge = { status: "level", note: `Legacy Max (Level): ${c.mMin}-${c.mMax} lbs. Also qualifies for Legacy (Graded).` };
+  } else if (weight >= c.gMin && weight <= c.gMax) {
+    results.Corebridge = { status: "graded", note: `Legacy (Graded) only: ${c.gMin}-${c.gMax} lbs. Legacy Max requires ${c.mMin}-${c.mMax}.` };
+  } else {
+    results.Corebridge = { status: "decline", note: `Outside all bands. Legacy: ${c.gMin}-${c.gMax}, Legacy Max: ${c.mMin}-${c.mMax}.` };
+  }
+
+  // Mutual of Omaha — Living Promise has separate Level and Graded max columns
+  const m = MOO_BUILD[heightInches];
+  if (!m) {
+    results["Mutual of Omaha"] = { status: "decline", note: "Height outside chart (4'8\"-6'10\")." };
+  } else if (weight < m.min) {
+    results["Mutual of Omaha"] = { status: "decline", note: `Below minimum ${m.min} lbs.` };
+  } else if (weight <= m.levelMax) {
+    results["Mutual of Omaha"] = { status: "level", note: `Living Promise Level Benefit max: ${m.levelMax} lbs. Min: ${m.min}.` };
+  } else if (weight <= m.gradedMax) {
+    results["Mutual of Omaha"] = { status: "graded", note: `Over Level (${m.levelMax}) but within Graded max (${m.gradedMax}). Build alone routes to Graded.` };
+  } else {
+    results["Mutual of Omaha"] = { status: "decline", note: `Over Graded max (${m.gradedMax}). Build alone declines for Living Promise.` };
+  }
+
+  // Ethos / TruStage — hard limits only (85-450 lbs, 4'8"-7')
+  if (heightInches < 56 || heightInches > 84) {
+    results["Ethos / TruStage"] = { status: "decline", note: "Outside 4'8\"-7' height range — hard knockout." };
+  } else if (weight < 85 || weight > 450) {
+    results["Ethos / TruStage"] = { status: "decline", note: "Outside 85-450 lbs — hard knockout for TAWL/Term. GAWL still available." };
+  } else {
+    results["Ethos / TruStage"] = { status: "review", note: "Within 85-450 lbs / 4'8\"-7'. Final decision based on health + database lookup." };
+  }
+
+  return results;
+}
+
+function BlackWingQuoter() {
+  const [tab, setTab] = useState("quoter");
+
+  const [age, setAge] = useState("");
+  const [coverage, setCoverage] = useState("");
+  const [health, setHealth] = useState("");
+  const [product, setProduct] = useState("standard");
+
+  const [conditionQuery, setConditionQuery] = useState("");
+  const [medQuery, setMedQuery] = useState("");
+
+  // Build chart inputs
+  const [heightFt, setHeightFt] = useState("");
+  const [heightIn, setHeightIn] = useState("");
+  const [weight, setWeight] = useState("");
+
+  const ageNum = parseInt(age, 10);
+  const covNum = parseInt(coverage, 10);
+  const inputsReady = !isNaN(ageNum) && !isNaN(covNum) && health && product;
+
+  const results = useMemo(() => {
+    if (!inputsReady) return null;
+    const list = [];
+
+    if (product === "standard") {
+      // TRANSAMERICA — primary go-to (highest pay)
+      if (ageNum >= 18 && ageNum <= 75 && covNum <= 100000) {
+        if (health === "good" || health === "moderate") {
+          list.push({ tier: 1, carrier: "Transamerica", plan: "FE Express Solution", note: "Default go-to. Ages 18-75 up to $100K, 76-85 up to $25K.", badge: "PRIMARY", wait: null, score: 135 });
+        }
+        if (health === "poor") {
+          list.push({ tier: 2, carrier: "Transamerica", plan: "Graded FE Express", note: "Use when standard is ruled out. 110% premium return yr 1-2.", badge: "GRADED", wait: "2-year wait", score: 98 });
+        }
+      }
+      if (ageNum >= 76 && ageNum <= 85 && covNum <= 25000 && (health === "good" || health === "moderate")) {
+        list.push({ tier: 1, carrier: "Transamerica", plan: "FE Express (76-85)", note: "Ages 76-85 capped at $25K face.", badge: null, wait: null, score: 135 });
+      }
+
+      // FIDELITY LIFE (via Instabrain)
+      if (covNum <= 40000) {
+        if (ageNum >= 50 && ageNum <= 69 && health !== "poor") {
+          list.push({ tier: 1, carrier: "Fidelity Life", plan: "RAPIDecision Final Expense", note: "Strong option ages 50-69. Up to $40K. All 12 health Qs must be NO.", badge: null, wait: null, score: 133 });
+        } else if (ageNum >= 70 && ageNum <= 79 && health !== "poor") {
+          list.push({ tier: 2, carrier: "Fidelity Life", plan: "RAPIDecision Final Expense", note: "Ages 70-79. Up to $40K.", badge: null, wait: null, score: 108 });
+        } else if (ageNum >= 80 && ageNum <= 85 && health !== "poor") {
+          list.push({ tier: 3, carrier: "Fidelity Life", plan: "RAPIDecision Final Expense", note: "Ages 80-85. Up to $40K.", badge: null, wait: null, score: 93 });
+        }
+      }
+
+      // COREBRIDGE
+      if (ageNum >= 50 && ageNum <= 80 && health === "good") {
+        list.push({ tier: 1, carrier: "Corebridge", plan: "SimpliNow Legacy Max", note: "Healthy 50-80. Level death benefit. $36 annual fee.", badge: "HEALTHY ONLY", wait: null, score: 132 });
+      }
+      if (ageNum >= 50 && ageNum <= 80 && (health === "good" || health === "moderate")) {
+        list.push({ tier: 2, carrier: "Corebridge", plan: "SimpliNow Legacy", note: "Graded — 110% premium return yr 1-2.", badge: null, wait: "2-year wait", score: 92 });
+      }
+
+      // MUTUAL OF OMAHA
+      if (ageNum >= 45 && ageNum <= 80 && covNum <= 50000 && health === "good") {
+        list.push({ tier: 1, carrier: "Mutual of Omaha", plan: "Living Promise Level", note: "Strict UW = often cheapest premium. All Part One/Two questions must be NO.", badge: "BEST PRICE IF QUALIFIED", wait: null, score: 125 });
+      }
+      if (ageNum >= 45 && ageNum <= 80 && covNum <= 50000 && health === "moderate") {
+        list.push({ tier: 3, carrier: "Mutual of Omaha", plan: "Living Promise Graded", note: "Part Two YES answers route here. No riders available.", badge: "GRADED", wait: "2-year wait", score: 85 });
+      }
+      if (ageNum >= 81 && ageNum <= 85 && covNum <= 50000) {
+        list.push({ tier: 3, carrier: "Mutual of Omaha", plan: "Living Promise Graded (81-85)", note: "Only graded available at this age band.", badge: "GRADED", wait: "2-year wait", score: 85 });
+      }
+
+      // ETHOS / TRUSTAGE — most lenient but lowest pay = fallback
+      if (ageNum >= 18 && ageNum <= 70 && covNum <= 100000) {
+        list.push({ tier: 4, carrier: "Ethos / TruStage", plan: "TAWL — Advantage WL", note: "Most lenient UW but lowest payout. Use when other carriers decline. Ages 18-70 up to $100K.", badge: "LENIENT FALLBACK", wait: null, score: 67 });
+      }
+      if (ageNum >= 71 && ageNum <= 75 && covNum <= 50000) {
+        list.push({ tier: 4, carrier: "Ethos / TruStage", plan: "TAWL — Advantage WL (71-75)", note: "Most lenient UW but lowest payout. Up to $50K.", badge: "LENIENT FALLBACK", wait: null, score: 67 });
+      }
+      if (ageNum >= 76 && ageNum <= 85 && covNum <= 25000) {
+        list.push({ tier: 4, carrier: "Ethos / TruStage", plan: "TAWL — Advantage WL (76-85)", note: "Most lenient UW. Up to $25K. Use when others decline.", badge: "LENIENT FALLBACK", wait: null, score: 67 });
+      }
+    }
+
+    if (product === "gi") {
+      // COREBRIDGE GI — primary
+      if (ageNum >= 50 && ageNum <= 80 && covNum <= 25000) {
+        list.push({ tier: 1, carrier: "Corebridge", plan: "Guaranteed Issue", note: "Everyone approved. Best GI payout. Up to $25K.", badge: "PRIMARY", wait: "2-year wait", score: 80 });
+      }
+      // FIDELITY GI
+      if (covNum <= 25000) {
+        if (ageNum >= 50 && ageNum <= 69) {
+          list.push({ tier: 2, carrier: "Fidelity Life", plan: "RAPIDecision GI", note: "Backup if Corebridge isn't a fit. 3-year graded benefit.", badge: null, wait: "3-year graded", score: 78 });
+        } else if (ageNum >= 70 && ageNum <= 79) {
+          list.push({ tier: 2, carrier: "Fidelity Life", plan: "RAPIDecision GI", note: "Ages 70-79. 3-year graded benefit.", badge: null, wait: "3-year graded", score: 58 });
+        } else if (ageNum >= 80 && ageNum <= 85) {
+          list.push({ tier: 1, carrier: "Fidelity Life", plan: "RAPIDecision GI", note: "Primary at 80-85 (Corebridge cuts off at 80).", badge: "PRIMARY", wait: "3-year graded", score: 48 });
+        }
+      }
+      // ETHOS / TRUSTAGE GAWL
+      if (ageNum >= 45 && ageNum <= 80 && covNum <= 25000) {
+        list.push({ tier: 99, carrier: "Ethos / TruStage", plan: "GAWL — Guaranteed Acceptance", note: "DO NOT WRITE. Lowest payout. 100% premium + 10% return yr 1-2.", badge: "AVOID", wait: "2-year wait", score: 28 });
+      }
+    }
+
+    list.sort((a, b) => b.score - a.score);
+    return list;
+  }, [ageNum, covNum, health, product, inputsReady]);
+
+  const eligible = results ? results.filter((r) => r.tier !== 99) : [];
+  const avoid = results ? results.filter((r) => r.tier === 99) : [];
+
+  const conditionMatches = useMemo(() => {
+    const q = conditionQuery.trim().toLowerCase();
+    if (!q) return [];
+    return CONDITIONS_DB.filter((c) =>
+      c.label.toLowerCase().includes(q) || c.aliases.some((a) => a.includes(q) || q.includes(a))
+    );
+  }, [conditionQuery]);
+
+  const medMatches = useMemo(() => {
+    const q = medQuery.trim().toLowerCase();
+    if (!q) return [];
+    return MEDICATIONS_DB.filter((m) =>
+      m.name.toLowerCase().includes(q) ||
+      m.generic.toLowerCase().includes(q) ||
+      m.condition.toLowerCase().includes(q)
+    );
+  }, [medQuery]);
+
+  // Build chart evaluation
+  const buildResult = useMemo(() => {
+    const ft = parseInt(heightFt, 10);
+    const inch = parseInt(heightIn, 10);
+    const wt = parseInt(weight, 10);
+    if (isNaN(ft) || isNaN(inch) || isNaN(wt)) return null;
+    if (inch < 0 || inch > 11) return null;
+    const totalInches = ft * 12 + inch;
+    return { totalInches, weight: wt, results: evaluateBuild(totalInches, wt) };
+  }, [heightFt, heightIn, weight]);
+
+  const reset = () => {
+    setAge("");
+    setCoverage("");
+    setHealth("");
+    setProduct("standard");
+  };
+
+  return (
+    <div className="min-h-screen bg-black text-slate-100" style={{ fontFamily: "'Barlow', system-ui, sans-serif" }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Barlow:wght@300;400;500;600;700&family=Barlow+Condensed:wght@500;600;700;800;900&family=JetBrains+Mono:wght@400;500;700&display=swap');
+        .display { font-family: 'Barlow Condensed', sans-serif; }
+        .mono { font-family: 'JetBrains Mono', monospace; }
+        .bw-glow { background: radial-gradient(ellipse at top, rgba(34, 211, 238, 0.08) 0%, transparent 60%); }
+        .bw-grid {
+          background-image:
+            linear-gradient(rgba(34, 211, 238, 0.03) 1px, transparent 1px),
+            linear-gradient(90deg, rgba(34, 211, 238, 0.03) 1px, transparent 1px);
+          background-size: 40px 40px;
+        }
+        .pulse-dot { animation: pulse 2s ease-in-out infinite; }
+        @keyframes pulse {
+          0%, 100% { opacity: 1; box-shadow: 0 0 12px rgba(34, 211, 238, 0.8); }
+          50% { opacity: 0.4; box-shadow: 0 0 4px rgba(34, 211, 238, 0.4); }
+        }
+        .stagger-1 { animation: slideUp 0.4s 0.05s both ease-out; }
+        .stagger-2 { animation: slideUp 0.4s 0.10s both ease-out; }
+        .stagger-3 { animation: slideUp 0.4s 0.15s both ease-out; }
+        .stagger-4 { animation: slideUp 0.4s 0.20s both ease-out; }
+        .stagger-5 { animation: slideUp 0.4s 0.25s both ease-out; }
+        .stagger-6 { animation: slideUp 0.4s 0.30s both ease-out; }
+        @keyframes slideUp {
+          from { opacity: 0; transform: translateY(8px); }
+          to { opacity: 1; transform: translateY(0); }
+        }
+      `}</style>
+
+      <div className="bw-glow min-h-screen">
+        <div className="bw-grid">
+
+          <header className="border-b border-slate-900 px-6 py-5 backdrop-blur-sm">
+            <div className="max-w-6xl mx-auto flex items-center justify-between">
+              <div className="flex items-center gap-4">
+                <svg width="44" height="44" viewBox="0 0 100 100" fill="none">
+                  <defs>
+                    <linearGradient id="wing" x1="0" y1="0" x2="1" y2="1">
+                      <stop offset="0%" stopColor="#67e8f9" />
+                      <stop offset="100%" stopColor="#0891b2" />
+                    </linearGradient>
+                  </defs>
+                  <path d="M50 35 Q35 30 18 38 Q25 42 22 50 Q35 46 42 52 Q35 56 38 62 Q44 56 50 60 Q56 56 62 62 Q65 56 58 52 Q65 46 78 50 Q75 42 82 38 Q65 30 50 35 Z" fill="url(#wing)" />
+                  <path d="M50 38 L48 65 L50 68 L52 65 Z" fill="#22d3ee" opacity="0.6" />
+                </svg>
+                <div>
+                  <div className="display font-black text-xl tracking-tight leading-none">BLACK WING</div>
+                  <div className="text-[9px] tracking-[0.4em] text-cyan-400 uppercase mt-0.5">Ventures · Field Tool</div>
+                </div>
+              </div>
+              <div className="flex items-center gap-3">
+                <div className="w-2 h-2 rounded-full bg-cyan-400 pulse-dot" />
+                <div className="text-[10px] tracking-[0.3em] text-slate-500 uppercase mono">Live</div>
+              </div>
+            </div>
+          </header>
+
+          <div className="max-w-6xl mx-auto px-6 py-10">
+
+            <div className="mb-8">
+              <div className="flex items-center gap-3 mb-4">
+                <div className="h-px w-8" style={{ background: "linear-gradient(90deg, #22d3ee 0%, transparent 100%)" }} />
+                <div className="text-[10px] tracking-[0.4em] text-cyan-400 uppercase mono">Final Expense WL · Carrier Routing</div>
+              </div>
+              <h1 className="display font-black text-5xl md:text-7xl leading-[0.9] tracking-tight">
+                PLACE EVERY CLIENT.<br />
+                <span className="text-cyan-400">MAXIMIZE EVERY DEAL.</span>
+              </h1>
+            </div>
+
+            <div className="flex gap-1 mb-8 border-b border-slate-900 overflow-x-auto">
+              {[
+                { id: "quoter", label: "Quoter" },
+                { id: "conditions", label: "Conditions" },
+                { id: "meds", label: "Medications" },
+                { id: "build", label: "Build Chart" },
+              ].map((t) => (
+                <button
+                  key={t.id}
+                  onClick={() => setTab(t.id)}
+                  className={`display font-bold px-6 py-3 text-sm tracking-widest uppercase transition-all border-b-2 whitespace-nowrap ${
+                    tab === t.id ? "border-cyan-400 text-cyan-400" : "border-transparent text-slate-500 hover:text-slate-300"
+                  }`}
+                >
+                  {t.label}
+                </button>
+              ))}
+            </div>
+
+            {tab === "quoter" && (
+              <>
+                <div className="grid grid-cols-1 md:grid-cols-12 gap-3 mb-6">
+                  <div className="md:col-span-12">
+                    <div className="text-[10px] tracking-[0.3em] text-slate-500 uppercase mono mb-2">Product Type</div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <button
+                        onClick={() => setProduct("standard")}
+                        className={`display font-bold py-4 px-4 text-sm tracking-widest uppercase border transition-all ${
+                          product === "standard"
+                            ? "bg-cyan-400 text-black border-cyan-400 shadow-[0_0_30px_rgba(34,211,238,0.3)]"
+                            : "bg-slate-950 border-slate-800 text-slate-300 hover:border-cyan-500/50"
+                        }`}
+                      >
+                        Standard WL
+                      </button>
+                      <button
+                        onClick={() => setProduct("gi")}
+                        className={`display font-bold py-4 px-4 text-sm tracking-widest uppercase border transition-all ${
+                          product === "gi"
+                            ? "bg-cyan-400 text-black border-cyan-400 shadow-[0_0_30px_rgba(34,211,238,0.3)]"
+                            : "bg-slate-950 border-slate-800 text-slate-300 hover:border-cyan-500/50"
+                        }`}
+                      >
+                        Guaranteed Issue
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="md:col-span-4">
+                    <div className="text-[10px] tracking-[0.3em] text-slate-500 uppercase mono mb-2">Age</div>
+                    <input
+                      type="number"
+                      value={age}
+                      onChange={(e) => setAge(e.target.value)}
+                      placeholder="65"
+                      className="w-full bg-slate-950 border border-slate-800 px-4 py-3 text-2xl font-bold display focus:outline-none focus:border-cyan-400 transition-colors text-slate-100"
+                    />
+                  </div>
+
+                  <div className="md:col-span-4">
+                    <div className="text-[10px] tracking-[0.3em] text-slate-500 uppercase mono mb-2">Coverage $</div>
+                    <input
+                      type="number"
+                      value={coverage}
+                      onChange={(e) => setCoverage(e.target.value)}
+                      placeholder="25000"
+                      className="w-full bg-slate-950 border border-slate-800 px-4 py-3 text-2xl font-bold display focus:outline-none focus:border-cyan-400 transition-colors text-slate-100"
+                    />
+                  </div>
+
+                  <div className="md:col-span-4">
+                    <div className="text-[10px] tracking-[0.3em] text-slate-500 uppercase mono mb-2">Health</div>
+                    <div className="grid grid-cols-3 gap-1">
+                      {[
+                        { v: "good", l: "Good" },
+                        { v: "moderate", l: "Mod." },
+                        { v: "poor", l: "Poor" },
+                      ].map((h) => (
+                        <button
+                          key={h.v}
+                          onClick={() => setHealth(h.v)}
+                          className={`display font-semibold py-3 text-xs tracking-widest uppercase border transition-all ${
+                            health === h.v
+                              ? "bg-slate-100 text-black border-slate-100"
+                              : "bg-slate-950 border-slate-800 text-slate-400 hover:border-cyan-500/50"
+                          }`}
+                        >
+                          {h.l}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="mb-8 flex justify-between items-center">
+                  <div className="text-[10px] tracking-[0.3em] text-slate-600 uppercase mono">
+                    {inputsReady ? `▸ ${ageNum}YO · $${covNum.toLocaleString()} · ${health.toUpperCase()}` : "▸ Awaiting Input"}
+                  </div>
+                  <button onClick={reset} className="text-[10px] tracking-[0.3em] text-slate-500 hover:text-cyan-400 uppercase mono">
+                    Reset →
+                  </button>
+                </div>
+
+                {!inputsReady && (
+                  <div className="border border-dashed border-slate-800 py-20 text-center">
+                    <div className="display font-black text-3xl text-slate-700 tracking-wider">FILL THE FIELDS</div>
+                    <div className="text-[10px] tracking-[0.4em] text-slate-700 uppercase mt-2 mono">to see ranked carriers</div>
+                  </div>
+                )}
+
+                {inputsReady && eligible.length === 0 && (
+                  <div className="border border-slate-800 bg-slate-950/50 py-12 px-6 text-center">
+                    <div className="display font-black text-3xl text-cyan-400 tracking-wider mb-2">NO CARRIER FIT</div>
+                    <div className="text-slate-400 text-sm">Profile falls outside all carrier rules. Verify age limits and coverage caps.</div>
+                  </div>
+                )}
+
+                {inputsReady && eligible.length > 0 && (
+                  <>
+                    <div className="flex items-baseline justify-between mb-4">
+                      <div className="text-[10px] tracking-[0.3em] text-slate-500 uppercase mono">▸ Ranked Routing</div>
+                      <div className="text-[10px] tracking-[0.3em] text-slate-500 uppercase mono">{eligible.length} match{eligible.length === 1 ? "" : "es"}</div>
+                    </div>
+
+                    <div className="space-y-2">
+                      {eligible.map((r, i) => (
+                        <div
+                          key={i}
+                          className={`stagger-${Math.min(i + 1, 6)} border ${
+                            i === 0
+                              ? "border-cyan-400/40 bg-gradient-to-r from-cyan-500/[0.05] to-transparent shadow-[0_0_30px_rgba(34,211,238,0.05)]"
+                              : "border-slate-800 bg-slate-950/30"
+                          } p-5 hover:bg-slate-900/40 transition-colors`}
+                        >
+                          <div className="grid grid-cols-12 gap-4 items-start">
+                            <div className="col-span-2 md:col-span-1">
+                              <div className={`display font-black text-4xl ${i === 0 ? "text-cyan-400" : "text-slate-700"}`}>
+                                {String(i + 1).padStart(2, "0")}
+                              </div>
+                            </div>
+
+                            <div className="col-span-10 md:col-span-9">
+                              <div className="flex items-baseline gap-3 flex-wrap mb-1">
+                                <div className="display font-bold text-2xl text-slate-100 tracking-wide">{r.carrier.toUpperCase()}</div>
+                                <div className="text-slate-500 text-sm">— {r.plan}</div>
+                                {r.badge && (
+                                  <span
+                                    className={`display font-bold text-[9px] tracking-[0.2em] uppercase px-2 py-0.5 ${
+                                      r.badge === "PRIMARY"
+                                        ? "bg-cyan-400 text-black"
+                                        : r.badge === "BEST PRICE IF QUALIFIED"
+                                        ? "bg-emerald-400/10 text-emerald-300 border border-emerald-400/40"
+                                        : r.badge === "GRADED"
+                                        ? "bg-slate-800 text-slate-400 border border-slate-700"
+                                        : r.badge === "HEALTHY ONLY"
+                                        ? "bg-cyan-400/10 text-cyan-300 border border-cyan-400/40"
+                                        : r.badge === "LENIENT FALLBACK"
+                                        ? "bg-amber-500/10 text-amber-300 border border-amber-500/40"
+                                        : "bg-slate-800 text-slate-500 border border-slate-700"
+                                    }`}
+                                  >
+                                    {r.badge}
+                                  </span>
+                                )}
+                              </div>
+                              <div className="text-slate-400 text-sm leading-relaxed">{r.note}</div>
+                              {r.wait && (
+                                <div className="text-[10px] tracking-[0.2em] text-amber-400 uppercase mt-2 mono">
+                                  ⚠ {r.wait}
+                                </div>
+                              )}
+                            </div>
+
+                            <div className="col-span-12 md:col-span-2 flex md:justify-end items-center">
+                              <div className="text-[9px] tracking-[0.3em] text-slate-600 uppercase mono">
+                                {i === 0 ? "Try First" : i === 1 ? "If No Fit" : "Fallback"}
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+
+                    {avoid.length > 0 && (
+                      <div className="mt-8 pt-6 border-t border-slate-900">
+                        <div className="text-[10px] tracking-[0.3em] text-red-400/70 uppercase mono mb-3">▸ Do Not Write</div>
+                        {avoid.map((r, i) => (
+                          <div key={i} className="border border-red-900/40 bg-red-950/10 p-4 flex items-baseline gap-4">
+                            <div className="display font-bold text-xl text-red-400/70 line-through tracking-wide">{r.carrier.toUpperCase()}</div>
+                            <div className="text-slate-500 text-sm">{r.note}</div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </>
+                )}
+              </>
+            )}
+
+            {tab === "conditions" && (
+              <>
+                <div className="mb-6">
+                  <div className="text-[10px] tracking-[0.3em] text-slate-500 uppercase mono mb-2">Search Health Condition</div>
+                  <input
+                    type="text"
+                    value={conditionQuery}
+                    onChange={(e) => setConditionQuery(e.target.value)}
+                    placeholder="diabetes, COPD, AFib, cancer, stroke..."
+                    className="w-full bg-slate-950 border border-slate-800 px-5 py-4 text-lg display font-medium focus:outline-none focus:border-cyan-400 transition-colors text-slate-100"
+                  />
+                </div>
+
+                <div className="mb-6 p-3 border border-cyan-500/20 bg-cyan-500/5 flex items-start gap-3">
+                  <div className="text-cyan-400 mono text-xs mt-0.5">✓</div>
+                  <div className="text-xs text-cyan-200/80 leading-relaxed">
+                    <span className="font-bold">All 5 carriers verified.</span> Sourced from Transamerica FE Express UW Guide (01/26), Corebridge SimpliNow Legacy UW Guide (REV0424), Mutual of Omaha Living Promise Application, Fidelity Life RAPIDecision (OCT 2023), and TruStage Life UW Guide 2025 + Health Needs Assessment.
+                  </div>
+                </div>
+
+                {!conditionQuery && (
+                  <>
+                    <div className="text-[10px] tracking-[0.3em] text-slate-500 uppercase mono mb-3">All Conditions ({CONDITIONS_DB.length})</div>
+                    <div className="grid grid-cols-2 md:grid-cols-3 gap-2">
+                      {CONDITIONS_DB.map((c) => (
+                        <button
+                          key={c.id}
+                          onClick={() => setConditionQuery(c.aliases[0])}
+                          className="text-left border border-slate-800 bg-slate-950/40 p-3 hover:border-cyan-500/40 hover:bg-slate-900/40 transition-all"
+                        >
+                          <div className="display font-semibold text-sm text-slate-200">{c.label}</div>
+                        </button>
+                      ))}
+                    </div>
+                  </>
+                )}
+
+                {conditionQuery && conditionMatches.length === 0 && (
+                  <div className="border border-dashed border-slate-800 py-16 text-center">
+                    <div className="display font-black text-2xl text-slate-700 tracking-wider mb-2">NO MATCHES</div>
+                    <div className="text-xs text-slate-600">Try "diabetes", "COPD", "cancer", "heart attack", "stroke", "kidney"...</div>
+                  </div>
+                )}
+
+                {conditionQuery && conditionMatches.length > 0 && (
+                  <div className="space-y-6">
+                    {conditionMatches.map((c, i) => (
+                      <div key={i} className="border border-slate-800 bg-slate-950/40 p-5">
+                        <div className="display font-bold text-2xl text-cyan-400 tracking-wide mb-1">{c.label.toUpperCase()}</div>
+                        <div className="text-[10px] tracking-[0.3em] text-slate-600 uppercase mono mb-4">▸ Carrier Disposition</div>
+
+                        <div className="space-y-2">
+                          {Object.entries(c.carriers).map(([carrier, info]) => {
+                            const meta = STATUS_META[info.status];
+                            return (
+                              <div key={carrier} className={`border ${meta.border} ${meta.bg} p-3 flex items-start gap-4`}>
+                                <div className="display font-bold text-base text-slate-100 tracking-wide w-44 shrink-0">{carrier.toUpperCase()}</div>
+                                <div className={`display font-bold text-[10px] tracking-[0.2em] ${meta.color} w-20 shrink-0 pt-1`}>{meta.label}</div>
+                                <div className="text-xs text-slate-400 leading-relaxed flex-1">{info.note}</div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                <div className="mt-10 pt-6 border-t border-slate-900">
+                  <div className="text-[10px] tracking-[0.3em] text-slate-500 uppercase mono mb-3">▸ Status Legend</div>
+                  <div className="grid grid-cols-2 md:grid-cols-5 gap-2">
+                    {Object.entries(STATUS_META).map(([k, m]) => (
+                      <div key={k} className={`border ${m.border} ${m.bg} px-3 py-2`}>
+                        <div className={`display font-bold text-[10px] tracking-[0.2em] ${m.color}`}>{m.label}</div>
+                        <div className="text-[10px] text-slate-500 mt-0.5">
+                          {k === "level" && "Standard rates"}
+                          {k === "graded" && "Graded — wait period"}
+                          {k === "gi_only" && "GI products only"}
+                          {k === "decline" && "Will not write"}
+                          {k === "review" && "Verify with UW"}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </>
+            )}
+
+            {tab === "meds" && (
+              <>
+                <div className="mb-6">
+                  <div className="text-[10px] tracking-[0.3em] text-slate-500 uppercase mono mb-2">Search Medication (Brand or Generic)</div>
+                  <input
+                    type="text"
+                    value={medQuery}
+                    onChange={(e) => setMedQuery(e.target.value)}
+                    placeholder="Eliquis, Aricept, Suboxone, Keytruda..."
+                    className="w-full bg-slate-950 border border-slate-800 px-5 py-4 text-lg display font-medium focus:outline-none focus:border-cyan-400 transition-colors text-slate-100"
+                  />
+                </div>
+
+                <div className="mb-6 p-3 border border-cyan-500/20 bg-cyan-500/5 flex items-start gap-3">
+                  <div className="text-cyan-400 mono text-xs mt-0.5">✓</div>
+                  <div className="text-xs text-cyan-200/80 leading-relaxed">
+                    <span className="font-bold">{MEDICATIONS_DB.length} medications loaded</span> from Transamerica precluded drug list, Mutual of Omaha Living Promise medication list, and Corebridge medication impact list. TruStage uses 7-year database lookback — most decline meds inferred from underlying condition rules.
+                  </div>
+                </div>
+
+                {!medQuery && (
+                  <>
+                    <div className="text-[10px] tracking-[0.3em] text-slate-500 uppercase mono mb-3">Common Decline Drugs</div>
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+                      {["Aricept", "Suboxone", "Keytruda", "Eliquis", "Entresto", "Daliresp", "Lupron", "Prograf"].map((m) => (
+                        <button
+                          key={m}
+                          onClick={() => setMedQuery(m)}
+                          className="text-left border border-slate-800 bg-slate-950/40 p-3 hover:border-cyan-500/40 hover:bg-slate-900/40 transition-all"
+                        >
+                          <div className="display font-semibold text-sm text-slate-200">{m}</div>
+                        </button>
+                      ))}
+                    </div>
+                  </>
+                )}
+
+                {medQuery && medMatches.length === 0 && (
+                  <div className="border border-dashed border-slate-800 py-16 text-center">
+                    <div className="display font-black text-2xl text-slate-700 tracking-wider mb-2">NOT IN DATABASE</div>
+                    <div className="text-xs text-slate-600 max-w-md mx-auto">Drug not on uploaded preclusion lists. Check the carrier UW guide directly or contact underwriting.</div>
+                  </div>
+                )}
+
+                {medQuery && medMatches.length > 0 && (
+                  <div className="space-y-4">
+                    {medMatches.map((m, i) => (
+                      <div key={i} className="border border-slate-800 bg-slate-950/40 p-5">
+                        <div className="flex items-baseline gap-3 flex-wrap mb-1">
+                          <div className="display font-bold text-2xl text-cyan-400 tracking-wide">{m.name.toUpperCase()}</div>
+                          <div className="text-slate-500 text-sm">({m.generic})</div>
+                        </div>
+                        <div className="text-xs tracking-wide text-slate-400 mb-4">Typically prescribed for: <span className="text-slate-200">{m.condition}</span></div>
+
+                        <div className="space-y-2">
+                          {Object.entries(m.carriers).map(([carrier, status]) => {
+                            const meta = STATUS_META[status];
+                            return (
+                              <div key={carrier} className={`border ${meta.border} ${meta.bg} p-3 flex items-center gap-4`}>
+                                <div className="display font-bold text-base text-slate-100 tracking-wide w-44 shrink-0">{carrier.toUpperCase()}</div>
+                                <div className={`display font-bold text-[10px] tracking-[0.2em] ${meta.color}`}>{meta.label}</div>
+                              </div>
+                            );
+                          })}
+                          {!m.carriers["Fidelity Life"] && (
+                            <div className="border border-slate-800/60 bg-slate-900/20 p-3 flex items-center gap-4">
+                              <div className="display font-bold text-base text-slate-500 tracking-wide w-44 shrink-0">FIDELITY LIFE</div>
+                              <div className="display font-bold text-[10px] tracking-[0.2em] text-slate-500">— UW DRIVEN —</div>
+                              <div className="text-xs text-slate-500">Not on a published list. Tied to underlying condition.</div>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </>
+            )}
+
+            {tab === "build" && (
+              <>
+                <div className="grid grid-cols-1 md:grid-cols-12 gap-3 mb-6">
+                  <div className="md:col-span-3">
+                    <div className="text-[10px] tracking-[0.3em] text-slate-500 uppercase mono mb-2">Height (Feet)</div>
+                    <input
+                      type="number"
+                      value={heightFt}
+                      onChange={(e) => setHeightFt(e.target.value)}
+                      placeholder="5"
+                      min="3" max="7"
+                      className="w-full bg-slate-950 border border-slate-800 px-4 py-3 text-2xl font-bold display focus:outline-none focus:border-cyan-400 transition-colors text-slate-100"
+                    />
+                  </div>
+                  <div className="md:col-span-3">
+                    <div className="text-[10px] tracking-[0.3em] text-slate-500 uppercase mono mb-2">Height (Inches)</div>
+                    <input
+                      type="number"
+                      value={heightIn}
+                      onChange={(e) => setHeightIn(e.target.value)}
+                      placeholder="8"
+                      min="0" max="11"
+                      className="w-full bg-slate-950 border border-slate-800 px-4 py-3 text-2xl font-bold display focus:outline-none focus:border-cyan-400 transition-colors text-slate-100"
+                    />
+                  </div>
+                  <div className="md:col-span-6">
+                    <div className="text-[10px] tracking-[0.3em] text-slate-500 uppercase mono mb-2">Weight (lbs)</div>
+                    <input
+                      type="number"
+                      value={weight}
+                      onChange={(e) => setWeight(e.target.value)}
+                      placeholder="180"
+                      className="w-full bg-slate-950 border border-slate-800 px-4 py-3 text-2xl font-bold display focus:outline-none focus:border-cyan-400 transition-colors text-slate-100"
+                    />
+                  </div>
+                </div>
+
+                <div className="mb-6 p-3 border border-cyan-500/20 bg-cyan-500/5 flex items-start gap-3">
+                  <div className="text-cyan-400 mono text-xs mt-0.5">✓</div>
+                  <div className="text-xs text-cyan-200/80 leading-relaxed">
+                    <span className="font-bold">All 5 build charts loaded.</span> Transamerica uses BMI bands. Corebridge has 2 tiers (Legacy Max stricter than Legacy). Fidelity Life uses single min/max. MOO has separate Level/Graded max. TruStage uses hard limits (85-450 lbs, 4'8"-7').
+                  </div>
+                </div>
+
+                {!buildResult && (
+                  <div className="border border-dashed border-slate-800 py-20 text-center">
+                    <div className="display font-black text-3xl text-slate-700 tracking-wider">ENTER HEIGHT & WEIGHT</div>
+                    <div className="text-[10px] tracking-[0.4em] text-slate-700 uppercase mt-2 mono">to evaluate all carriers</div>
+                  </div>
+                )}
+
+                {buildResult && (
+                  <>
+                    <div className="flex items-baseline justify-between mb-4">
+                      <div className="text-[10px] tracking-[0.3em] text-slate-500 uppercase mono">▸ Build Evaluation</div>
+                      <div className="text-[10px] tracking-[0.3em] text-cyan-400 uppercase mono">
+                        {formatHeight(buildResult.totalInches)} · {buildResult.weight} lbs
+                      </div>
+                    </div>
+
+                    <div className="space-y-2">
+                      {Object.entries(buildResult.results).map(([carrier, info], i) => {
+                        const meta = STATUS_META[info.status];
+                        return (
+                          <div
+                            key={carrier}
+                            className={`stagger-${Math.min(i + 1, 6)} border ${meta.border} ${meta.bg} p-4`}
+                          >
+                            <div className="flex items-start gap-4 flex-wrap">
+                              <div className="display font-bold text-lg text-slate-100 tracking-wide w-44 shrink-0">{carrier.toUpperCase()}</div>
+                              <div className={`display font-bold text-[10px] tracking-[0.2em] ${meta.color} w-20 shrink-0 pt-1.5`}>{meta.label}</div>
+                              <div className="text-xs text-slate-300 leading-relaxed flex-1 min-w-[200px] pt-1">{info.note}</div>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+
+                    <div className="mt-8 pt-6 border-t border-slate-900">
+                      <div className="text-[10px] tracking-[0.3em] text-slate-500 uppercase mono mb-3">▸ Notes for Agents</div>
+                      <div className="text-xs text-slate-400 leading-relaxed space-y-2">
+                        <div>• <span className="text-slate-200">Transamerica</span> uses BMI logic — graded weight bands sit just above and below the Select range.</div>
+                        <div>• <span className="text-slate-200">Corebridge</span> Legacy Max requires tighter build than Legacy. If client falls in the gap, route to Legacy (graded) instead.</div>
+                        <div>• <span className="text-slate-200">Fidelity Life</span> Final Expense has no graded for build — outside the range means GI.</div>
+                        <div>• <span className="text-slate-200">Mutual of Omaha</span> Living Promise has separate Level and Graded max columns. Build between Level max and Graded max routes to Graded plan. Multiple impairments tighten this further.</div>
+                        <div>• <span className="text-slate-200">Ethos / TruStage</span> hard limits only — within range still requires UW review.</div>
+                      </div>
+                    </div>
+                  </>
+                )}
+              </>
+            )}
+
+            <div className="mt-16 pt-6 border-t border-slate-900 flex justify-between items-center">
+              <div className="text-[9px] tracking-[0.4em] text-slate-700 uppercase mono">Black Wing Ventures · Internal</div>
+              <div className="text-[9px] tracking-[0.4em] text-slate-700 uppercase mono">Verify w/ Carrier UW Guide</div>
+            </div>
+
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(React.createElement(BlackWingQuoter));
+document.getElementById('loader').style.display = 'none';
+</script>
+</body>
+</html>
